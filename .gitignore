@@ -29,3 +29,9 @@ desktop.ini
 /checkpoints/*
 !/checkpoints/*.yaml
 /outputs/
+
+
+# xxtitan
+uploads/
+logs/*
+!logs/.gitkeep
