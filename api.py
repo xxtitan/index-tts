@@ -9,6 +9,7 @@ import warnings
 from typing import Optional, List, Dict, Annotated
 import uuid
 import hashlib
+import json
 from dataclasses import dataclass
 
 import numpy as np
@@ -118,6 +119,7 @@ class TaskStatus(BaseModel):
     progress: float = 0.0
     message: str = ""
     audio_url: Optional[str] = None
+    duration: Optional[float] = None  # 音频时长（毫秒）
     created_at: float
     completed_at: Optional[float] = None
 
@@ -127,7 +129,7 @@ class ServerConfig:
     """服务器配置"""
 
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = 30000
     model_dir: str = "./checkpoints"
     fp16: bool = False
     deepspeed: bool = False
@@ -298,6 +300,40 @@ class TTSTaskManager:
 class TTSFileManager:
     """TTS文件管理器"""
 
+    MAPPING_FILE = os.path.join("uploads", "config.json")
+
+    @staticmethod
+    def load_file_mapping() -> Dict[str, str]:
+        """加载文件ID到文件名的映射"""
+        if not os.path.exists(TTSFileManager.MAPPING_FILE):
+            return {}
+        
+        try:
+            with open(TTSFileManager.MAPPING_FILE, "r", encoding="utf-8") as f:
+                return json.loads(f.read())
+        except (json.JSONDecodeError, FileNotFoundError):
+            logger.warning("文件映射文件损坏或不存在，创建新的映射")
+            return {}
+
+    @staticmethod
+    def save_file_mapping(mapping: Dict[str, str]):
+        """保存文件ID到文件名的映射"""
+        os.makedirs(os.path.dirname(TTSFileManager.MAPPING_FILE), exist_ok=True)
+        try:
+            with open(TTSFileManager.MAPPING_FILE, "w", encoding="utf-8") as f:
+                f.write(json.dumps(mapping, ensure_ascii=False, indent=2))
+        except Exception as e:
+            logger.error(f"保存文件映射失败: {e}")
+            raise
+
+    @staticmethod
+    def add_file_mapping(file_id: str, filename: str):
+        """添加文件ID到文件名的映射"""
+        mapping = TTSFileManager.load_file_mapping()
+        mapping[file_id] = filename
+        TTSFileManager.save_file_mapping(mapping)
+        logger.debug(f"添加文件映射: {file_id} -> {filename}")
+
     @staticmethod
     def normalize_emo_vec(emo_vec: List[float]) -> List[float]:
         """标准化情感向量"""
@@ -327,21 +363,13 @@ class TTSFileManager:
         if len(file_id) == 0 or len(file_id) > 100:
             raise ValueError(f"文件ID长度必须在1-100个字符之间: {file_id}")
 
-        # 查找匹配的文件
-        uploads_dir = "uploads"
-        if not os.path.exists(uploads_dir):
-            raise ValueError("上传目录不存在")
+        # 从映射文件中查找对应的文件名
+        mapping = TTSFileManager.load_file_mapping()
+        if file_id not in mapping:
+            raise ValueError(f"文件ID {file_id} 不存在")
 
-        # 查找以file_id开头的文件
-        matching_files = [f for f in os.listdir(uploads_dir) if f.startswith(file_id)]
-
-        if not matching_files:
-            raise ValueError(f"文件ID {file_id} 对应的文件不存在")
-
-        if len(matching_files) > 1:
-            raise ValueError(f"文件ID {file_id} 匹配到多个文件")
-
-        file_path = os.path.join(uploads_dir, matching_files[0])
+        filename = mapping[file_id]
+        file_path = os.path.join("uploads", filename)
 
         # 验证文件确实存在且可读
         if not os.path.isfile(file_path):
@@ -386,6 +414,28 @@ class TTSFileManager:
         except Exception as e:
             logger.error(f"音频文件验证失败: {file_path}, 错误: {e}")
             return False, f"音频格式不支持: {str(e)}"
+
+    @staticmethod
+    def get_audio_duration_ms(file_path: str) -> Optional[float]:
+        """获取音频文件时长（毫秒）
+        
+        Returns:
+            Optional[float]: 音频时长（毫秒），如果获取失败返回None
+        """
+        try:
+            import torchaudio
+            
+            # 使用torchaudio获取音频信息
+            audio_info = torchaudio.info(file_path)
+            duration_seconds = audio_info.num_frames / audio_info.sample_rate
+            duration_ms = duration_seconds * 1000
+            
+            logger.debug(f"音频时长: {file_path} -> {duration_ms:.1f}ms")
+            return duration_ms
+            
+        except Exception as e:
+            logger.error(f"获取音频时长失败: {file_path}, 错误: {e}")
+            return None
 
 
 class TTSService:
@@ -479,12 +529,18 @@ class TTSService:
 
             logger.info(f"TTS生成成功 - 任务ID: {task_id}, 输出: {output}")
 
+            # 计算音频时长
+            audio_duration_ms = TTSFileManager.get_audio_duration_ms(output_path)
+            if audio_duration_ms is not None:
+                logger.debug(f"音频时长: {audio_duration_ms:.1f}ms")
+            
             # 更新任务状态
             self.task_manager.update_task(
                 task_id,
                 status="completed",
                 progress=1.0,
                 audio_url=f"/api/v1/audio/{task_id}.wav",
+                duration=audio_duration_ms,
                 completed_at=time.time(),
                 message="生成完成",
             )
@@ -647,25 +703,29 @@ async def generate_tts_sync(
         # 同步生成
         logger.info(f"开始同步生成TTS - 任务ID: {task_id}")
         output_path = service.generate_tts(request, task_id)
-        duration = time.time() - start_time
+        processing_time = time.time() - start_time
 
-        logger.info(f"同步TTS生成成功 - 任务ID: {task_id}, 耗时: {duration:.2f}秒")
+        # 获取生成的音频时长
+        task = service.task_manager.get_task(task_id)
+        audio_duration_ms = task.duration if task else None
+
+        logger.info(f"同步TTS生成成功 - 任务ID: {task_id}, 处理耗时: {processing_time:.2f}秒, 音频时长: {audio_duration_ms}ms")
 
         return TTSResponse(
             success=True,
             message="生成完成",
             audio_url=f"/api/v1/audio/{task_id}.wav",
             task_id=task_id,
-            duration=duration,
+            duration=audio_duration_ms,
         )
 
     except Exception as e:
-        duration = time.time() - start_time
+        processing_time = time.time() - start_time
         logger.error(
-            f"同步TTS生成失败 - 任务ID: {task_id}, 耗时: {duration:.2f}秒, 错误: {e}"
+            f"同步TTS生成失败 - 任务ID: {task_id}, 处理耗时: {processing_time:.2f}秒, 错误: {e}"
         )
 
-        return TTSResponse(success=False, message=f"生成失败{str(e)}", task_id=task_id)
+        return TTSResponse(success=False, message=f"生成失败{str(e)}", task_id=task_id, duration=None)
 
 
 @app.get("/api/v1/task/{task_id}", response_model=TaskStatus)
@@ -716,7 +776,7 @@ async def get_audio(
 
 @app.post("/api/v1/upload/audio")
 async def upload_audio(
-    file: UploadFile = File(...), file_id: Optional[str] = Form(None)
+    file: UploadFile = File(...), file_id: str = Form(...)
 ):
     """上传音频文件"""
     logger.info(f"接收音频文件上传请求 - filename: {file.filename}, file_id: {file_id}")
@@ -730,29 +790,26 @@ async def upload_audio(
     content = await file.read()
     logger.debug(f"文件读取完成 - 文件大小: {len(content)} bytes")
 
-    # 使用用户提供的file_id或计算SHA256哈希值
-    if file_id:
-        # 验证用户提供的file_id格式（不允许包含路径分隔符等危险字符）
-        if not file_id.replace("_", "").replace("-", "").isalnum():
-            logger.warning(f"无效的file_id格式 - file_id: {file_id}")
-            raise HTTPException(
-                status_code=400, detail="file_id只能包含字母、数字、下划线和连字符"
-            )
-        if len(file_id) > 100:  # 限制长度避免文件名过长
-            logger.warning(f"file_id过长 - file_id: {file_id}")
-            raise HTTPException(status_code=400, detail="file_id长度不能超过100个字符")
-        actual_file_id = file_id
-        logger.info(f"使用用户自定义file_id: {actual_file_id}")
-    else:
-        # 使用SHA256哈希作为file_id
-        actual_file_id = TTSFileManager.calculate_file_hash(content)
-        logger.info(f"使用SHA256哈希作为file_id: {actual_file_id}")
+    # 验证用户提供的file_id格式（不允许包含路径分隔符等危险字符）
+    if not file_id.replace("_", "").replace("-", "").isalnum():
+        logger.warning(f"无效的file_id格式 - file_id: {file_id}")
+        raise HTTPException(
+            status_code=400, detail="file_id只能包含字母、数字、下划线和连字符"
+        )
+    if len(file_id) > 100:  # 限制长度避免文件名过长
+        logger.warning(f"file_id过长 - file_id: {file_id}")
+        raise HTTPException(status_code=400, detail="file_id长度不能超过100个字符")
 
+    # 统一使用SHA256哈希作为实际文件名
+    sha256_hash = TTSFileManager.calculate_file_hash(content)
     file_extension = os.path.splitext(file.filename)[1]
-    saved_filename = f"{actual_file_id}{file_extension}"
+    saved_filename = f"{sha256_hash}{file_extension}"
     saved_path = os.path.join("uploads", saved_filename)
-    logger.debug(f"保存新文件 - 路径: {saved_path}")
+    
+    logger.info(f"用户file_id: {file_id}, 实际保存文件名: {saved_filename}")
+    
     # 保存新文件
+    logger.debug(f"保存文件 - 路径: {saved_path}")
     with open(saved_path, "wb") as buffer:
         buffer.write(content)
 
@@ -765,15 +822,26 @@ async def upload_audio(
         os.remove(saved_path)
         raise HTTPException(status_code=400, detail=f"音频文件格式错误: {message}")
 
+    # 添加文件ID到文件名的映射关系
+    try:
+        TTSFileManager.add_file_mapping(file_id, saved_filename)
+        logger.info(f"成功添加文件映射: {file_id} -> {saved_filename}")
+    except Exception as e:
+        # 映射添加失败，删除文件
+        logger.error(f"添加文件映射失败，删除文件: {saved_path}")
+        os.remove(saved_path)
+        raise HTTPException(status_code=500, detail=f"保存文件映射失败: {str(e)}")
+
     logger.info(
-        f"文件上传成功 - 文件ID: {actual_file_id}, 大小: {len(content)} bytes, 验证: {message}"
+        f"文件上传成功 - 文件ID: {file_id}, 实际文件名: {saved_filename}, 大小: {len(content)} bytes, 验证: {message}"
     )
 
     return {
         "success": True,
         "message": f"文件上传成功 - {message}",
-        "file_id": actual_file_id,
+        "file_id": file_id,
         "original_filename": file.filename,
+        "saved_filename": saved_filename,
         "file_size": len(content),
         "upload_time": time.time(),
     }
@@ -806,6 +874,25 @@ async def get_file_info(file_id: str):
     except ValueError as e:
         logger.warning(f"文件信息查询失败 - 文件ID: {file_id}, 错误: {e}")
         raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/v1/files")
+async def get_file_mapping():
+    """获取所有文件ID到文件名的映射关系"""
+    logger.debug("查询文件映射关系")
+    
+    try:
+        mapping = TTSFileManager.load_file_mapping()
+        logger.debug(f"返回映射数量: {len(mapping)}")
+        
+        return {
+            "success": True,
+            "files": mapping,
+            "count": len(mapping)
+        }
+    except Exception as e:
+        logger.error(f"获取文件映射失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取文件映射失败: {str(e)}")
 
 
 @app.get("/api/v1/tasks")
@@ -842,7 +929,7 @@ def create_server_config_from_env() -> ServerConfig:
     """从环境变量创建服务器配置"""
     return ServerConfig(
         host=os.environ.get("INDEXTTS_HOST", "0.0.0.0"),
-        port=int(os.environ.get("INDEXTTS_PORT", "8000")),
+        port=int(os.environ.get("INDEXTTS_PORT", "30000")),
         model_dir=os.environ.get("INDEXTTS_MODEL_DIR", "./checkpoints"),
         fp16=os.environ.get("INDEXTTS_FP16", "false").lower() == "true",
         deepspeed=os.environ.get("INDEXTTS_DEEPSPEED", "false").lower() == "true",
@@ -866,7 +953,7 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--host", type=str, default="0.0.0.0", help="服务器主机地址")
-    parser.add_argument("--port", type=int, default=8000, help="服务器端口")
+    parser.add_argument("--port", type=int, default=30000, help="服务器端口")
     parser.add_argument(
         "--model_dir", type=str, default="./checkpoints", help="模型检查点目录"
     )
