@@ -108,7 +108,7 @@ class TTSResponse(BaseModel):
     message: str
     audio_url: Optional[str] = None
     task_id: Optional[str] = None
-    duration: Optional[float] = None
+    duration: Optional[int] = None
 
 
 class TaskStatus(BaseModel):
@@ -119,7 +119,7 @@ class TaskStatus(BaseModel):
     progress: float = 0.0
     message: str = ""
     audio_url: Optional[str] = None
-    duration: Optional[float] = None  # 音频时长（毫秒）
+    duration: Optional[int] = None  # 音频时长（毫秒）
     created_at: float
     completed_at: Optional[float] = None
 
@@ -416,11 +416,11 @@ class TTSFileManager:
             return False, f"音频格式不支持: {str(e)}"
 
     @staticmethod
-    def get_audio_duration_ms(file_path: str) -> Optional[float]:
+    def get_audio_duration_ms(file_path: str) -> Optional[int]:
         """获取音频文件时长（毫秒）
         
         Returns:
-            Optional[float]: 音频时长（毫秒），如果获取失败返回None
+            Optional[int]: 音频时长（毫秒的整数部分），如果获取失败返回None
         """
         try:
             import torchaudio
@@ -428,9 +428,9 @@ class TTSFileManager:
             # 使用torchaudio获取音频信息
             audio_info = torchaudio.info(file_path)
             duration_seconds = audio_info.num_frames / audio_info.sample_rate
-            duration_ms = duration_seconds * 1000
+            duration_ms = int(duration_seconds * 1000)
             
-            logger.debug(f"音频时长: {file_path} -> {duration_ms:.1f}ms")
+            logger.debug(f"音频时长: {file_path} -> {duration_ms}ms")
             return duration_ms
             
         except Exception as e:
@@ -532,7 +532,7 @@ class TTSService:
             # 计算音频时长
             audio_duration_ms = TTSFileManager.get_audio_duration_ms(output_path)
             if audio_duration_ms is not None:
-                logger.debug(f"音频时长: {audio_duration_ms:.1f}ms")
+                logger.debug(f"音频时长: {audio_duration_ms}ms")
             
             # 更新任务状态
             self.task_manager.update_task(
